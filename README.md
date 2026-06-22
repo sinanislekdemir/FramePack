@@ -26,6 +26,24 @@ FramePack can be trained with a much larger batch size, similar to the batch siz
 
 **2025 May 03:** The FramePack-F1 is released. [Try it here.](https://github.com/lllyasviel/FramePack/discussions/459)
 
+## Fork Enhancements
+
+This fork includes additional optimizations for faster generation:
+
+### MagCache Integration
+Integrated from [Zehong-Ma/FramePack](https://github.com/Zehong-Ma/FramePack/tree/integrate_MagCache). MagCache is a training-free cache mechanism that skips redundant transformer block computations during sampling, providing ~1.5-2x speedup with minimal quality loss. Available alongside TeaCache in the UI — only one cache can be active at a time.
+
+### NF4 4-bit Quantized Model (~5x faster on Blackwell GPUs)
+Pre-configured support for the community-quantized [NF4 4-bit transformer](https://huggingface.co/furusu/framepack_f1_transformer_nf4) using `bitsandbytes`. The quantized model uses ~7GB VRAM (vs ~12GB original), allowing:
+- More transformer layers to stay resident in GPU VRAM between sections
+- Significantly fewer CPU↔GPU transfers during section transitions
+- Combined with MagCache, **~5x total generation speedup** on RTX 50-series (Blackwell) GPUs
+
+Quality impact from NF4 quantization is virtually unnoticeable — the NormalFloat4 format is designed for normally-distributed weights, which matches the transformer's weight distribution.
+
+### Unified UI
+Run `python main.py` for the standard UI with bf16 models, or `python main_f8.py` for the NF4 4-bit optimized version. Both include model selection (F1/Legacy), attention backend selection (sdpa/flash/cudnn/sage), and MagCache/TeaCache controls directly in the GUI.
+
 Note that this GitHub repository is the only official FramePack website. We do not have any web services. All other websites are spam and fake, including but not limited to `framepack.co`, `frame_pack.co`, `framepack.net`, `frame_pack.net`, `framepack.ai`, `frame_pack.ai`, `framepack.pro`, `frame_pack.pro`, `framepack.cc`, `frame_pack.cc`,`framepackai.co`, `frame_pack_ai.co`, `framepackai.net`, `frame_pack_ai.net`, `framepackai.pro`, `frame_pack_ai.pro`, `framepackai.cc`, `frame_pack_ai.cc`, and so on. Again, they are all spam and fake. **Do not pay money or download files from any of those websites.**
 
 # Requirements
@@ -69,9 +87,18 @@ We recommend having an independent Python 3.10.
 
 To start the GUI, run:
 
-    python demo_gradio.py
+    python main.py                 # bf16 model, MagCache + TeaCache
+    python main_f8.py              # NF4 4-bit model, ~7GB VRAM, faster on Blackwell
 
-Note that it supports `--share`, `--port`, `--server`, and so on.
+The original demos are also available:
+
+    python demo_gradio.py          # legacy bf16 model, TeaCache only
+    python demo_gradio_f1.py       # F1 bf16 model, TeaCache only
+    python megcache_f1.py          # F1 bf16 model, MagCache + TeaCache
+
+Note that all scripts support `--share`, `--port`, `--server`, and so on.
+
+For the NF4 4-bit model (`main_f8.py`), `bitsandbytes` is required (`pip install bitsandbytes`). The model will be downloaded automatically on first run (~6.8GB).
 
 The software supports PyTorch attention, xformers, flash-attn, sage-attention. By default, it will just use PyTorch attention. You can install those attention kernels if you know how. 
 
