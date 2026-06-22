@@ -46,17 +46,21 @@ torch.set_num_interop_threads(min(8, (os.cpu_count() or 8)))
 # ---------------------------------------------------------------------------
 
 MODELS = {
-    "FramePack F1 FP8 e4m3fn (6GB VRAM)": {
+    "FramePack F1 NF4 4-bit (7GB VRAM)": {
+        "type": "nf4",
+        "repo": "furusu/framepack_f1_transformer_nf4",
+    },
+    "FramePack F1 FP8 e4m3fn (12GB VRAM)": {
         "type": "fp8",
         "weight_repo": "sirolim/FramePack_F1_I2V_FP8",
         "weight_file": "FramePack_F1_I2V_HY_fp8_e4m3fn.safetensors",
         "config_repo": "lllyasviel/FramePack_F1_I2V_HY_20250503",
     },
-    "FramePack F1 (Recommended)": {
+    "FramePack F1 bf16 (12GB VRAM)": {
         "type": "diffusers",
         "repo": "lllyasviel/FramePack_F1_I2V_HY_20250503",
     },
-    "FramePack (Legacy)": {
+    "FramePack Legacy bf16 (12GB VRAM)": {
         "type": "diffusers",
         "repo": "lllyasviel/FramePackI2V_HY",
     },
@@ -244,6 +248,16 @@ transformer = None
 orig_forward = None
 
 
+def load_nf4_transformer(model_info):
+    import bitsandbytes as bnb
+    model = HunyuanVideoTransformer3DModelPacked.from_pretrained(model_info["repo"])
+    print(f"  NF4 model loaded. Casting non-4bit params to bf16 ...")
+    for name, p in model.named_parameters():
+        if not isinstance(p, bnb.nn.Params4bit):
+            p.data = p.data.to(torch.bfloat16)
+    return model
+
+
 def load_fp8_transformer(model_info):
     from huggingface_hub import hf_hub_download
 
@@ -284,7 +298,9 @@ def load_transformer(model_name):
 
     model_info = MODELS[model_name]
 
-    if model_info["type"] == "fp8":
+    if model_info["type"] == "nf4":
+        transformer = load_nf4_transformer(model_info)
+    elif model_info["type"] == "fp8":
         transformer = load_fp8_transformer(model_info)
     else:
         transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
@@ -303,8 +319,8 @@ def load_transformer(model_name):
     print(f'Loaded {model_name} — Free VRAM: {free_mem_gb:.2f} GB')
 
 
-# Load default model (FP8) at startup
-load_transformer("FramePack F1 FP8 e4m3fn (6GB VRAM)")
+# Load default model (NF4 4-bit) at startup
+load_transformer("FramePack F1 NF4 4-bit (7GB VRAM)")
 
 # ---------------------------------------------------------------------------
 # State
@@ -624,12 +640,12 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack (FP8)')
+    gr.Markdown('# FramePack (NF4 4-bit)')
     with gr.Row():
         with gr.Column():
             with gr.Row():
                 model_selector = gr.Dropdown(
-                    choices=list(MODELS.keys()), value="FramePack F1 FP8 e4m3fn (6GB VRAM)",
+                    choices=list(MODELS.keys()), value="FramePack F1 NF4 4-bit (7GB VRAM)",
                     label="Model", interactive=True)
                 attn_selector = gr.Dropdown(
                     choices=ATTN_BACKENDS, value="sdpa",
