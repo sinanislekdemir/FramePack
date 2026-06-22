@@ -250,10 +250,12 @@ orig_forward = None
 
 def load_nf4_transformer(model_info):
     import bitsandbytes as bnb
-    model = HunyuanVideoTransformer3DModelPacked.from_pretrained(model_info["repo"])
-    print(f"  NF4 model loaded. Casting non-4bit params to bf16 ...")
+    model = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+        model_info["repo"], torch_dtype=torch.bfloat16
+    )
+    print(f"  NF4 model loaded. Ensuring non-4bit params are bf16 ...")
     for name, p in model.named_parameters():
-        if not isinstance(p, bnb.nn.Params4bit):
+        if not isinstance(p, bnb.nn.Params4bit) and p.dtype != torch.bfloat16:
             p.data = p.data.to(torch.bfloat16)
     return model
 
@@ -309,7 +311,8 @@ def load_transformer(model_name):
 
     transformer.eval()
     transformer.high_quality_fp32_output_for_inference = True
-    transformer.to(dtype=torch.bfloat16)
+    if model_info["type"] != "nf4":
+        transformer.to(dtype=torch.bfloat16)
     transformer.requires_grad_(False)
     DynamicSwapInstaller.install_model(transformer, device=gpu)
     orig_forward = transformer.__class__.forward
