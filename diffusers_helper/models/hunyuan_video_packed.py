@@ -57,6 +57,13 @@ except:
     sageattn_varlen = None
     sageattn = None
 
+attention_backend = None  # None = auto, 'flash', 'cudnn', 'sdpa', 'sage_attention'
+
+def set_attention_backend(backend):
+    global attention_backend
+    assert backend in ('auto', 'flash', 'cudnn', 'sdpa', 'sage_attention'), f"Unknown attention backend: {backend}"
+    attention_backend = backend
+    print(f'Attention backend set to: {backend}')
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -107,6 +114,19 @@ def apply_rotary_emb_transposed(x, freqs_cis):
 
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
     if cu_seqlens_q is None and cu_seqlens_kv is None and max_seqlen_q is None and max_seqlen_kv is None:
+        if attention_backend == 'flash':
+            if flash_attn_func is not None:
+                return flash_attn_func(q, k, v)
+            raise ValueError('flash attention requested but flash_attn is not installed')
+        if attention_backend in ('cudnn', 'sdpa'):
+            x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+            return x
+        if attention_backend == 'sage_attention':
+            if sageattn is not None:
+                x = sageattn(q, k, v, tensor_layout='NHD')
+                return x
+            raise ValueError('sage_attention requested but sageattention is not installed')
+
         if sageattn is not None:
             x = sageattn(q, k, v, tensor_layout='NHD')
             return x
@@ -128,12 +148,25 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
     k = k.flatten(0, 1)
     v = v.flatten(0, 1)
 
-    if sageattn_varlen is not None:
-        x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-    elif flash_attn_varlen_func is not None:
-        x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    if attention_backend == 'flash':
+        if flash_attn_varlen_func is not None:
+            x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        else:
+            raise ValueError('flash attention requested but flash_attn_varlen is not installed')
+    elif attention_backend in ('cudnn', 'sdpa'):
+        raise NotImplementedError(f'Varlen (batch>1) attention not supported with {attention_backend} backend')
+    elif attention_backend == 'sage_attention':
+        if sageattn_varlen is not None:
+            x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        else:
+            raise NotImplementedError('sage_attention requested but sageattn_varlen is not available')
     else:
-        raise NotImplementedError('No Attn Installed!')
+        if sageattn_varlen is not None:
+            x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        elif flash_attn_varlen_func is not None:
+            x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        else:
+            raise NotImplementedError('No Attn Installed!')
 
     x = x.unflatten(0, (B, L))
 
