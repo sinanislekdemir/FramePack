@@ -54,7 +54,11 @@ MODELS = {
         "type": "diffusers",
         "repo": "lllyasviel/FramePack_F1_I2V_HY_20250503",
     },
-    "FramePack Legacy (backward)": {
+    "FramePack Legacy NF4 4-bit (7GB VRAM)": {
+        "type": "nf4",
+        "repo": "furusu/framepack_transformer_nf4",
+    },
+    "FramePack Legacy bf16 (12GB VRAM)": {
         "type": "diffusers",
         "repo": "lllyasviel/FramePackI2V_HY",
     },
