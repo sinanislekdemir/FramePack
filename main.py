@@ -46,8 +46,18 @@ torch.set_num_interop_threads(min(8, (os.cpu_count() or 8)))
 # ---------------------------------------------------------------------------
 
 MODELS = {
-    "FramePack F1 (Recommended)": "lllyasviel/FramePack_F1_I2V_HY_20250503",
-    "FramePack (Legacy)": "lllyasviel/FramePackI2V_HY",
+    "FramePack F1 NF4 4-bit (7GB VRAM)": {
+        "type": "nf4",
+        "repo": "furusu/framepack_f1_transformer_nf4",
+    },
+    "FramePack F1 bf16 (12GB VRAM)": {
+        "type": "diffusers",
+        "repo": "lllyasviel/FramePack_F1_I2V_HY_20250503",
+    },
+    "FramePack Legacy (backward)": {
+        "type": "diffusers",
+        "repo": "lllyasviel/FramePackI2V_HY",
+    },
 }
 
 ATTN_BACKENDS = ["auto", "flash", "cudnn", "sdpa", "sage_attention"]
@@ -231,6 +241,23 @@ _current_model_name = None
 transformer = None
 orig_forward = None
 
+
+def load_nf4_transformer(model_info):
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError(
+            "bitsandbytes is required for NF4 models. Install it with: pip install bitsandbytes"
+        )
+    model = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+        model_info["repo"], torch_dtype=torch.bfloat16
+    )
+    for name, p in model.named_parameters():
+        if not isinstance(p, bnb.nn.Params4bit) and p.dtype != torch.bfloat16:
+            p.data = p.data.to(torch.bfloat16)
+    return model
+
+
 def load_transformer(model_name):
     global transformer, orig_forward, _current_model_name
     if _current_model_name == model_name and transformer is not None:
@@ -238,20 +265,29 @@ def load_transformer(model_name):
     if transformer is not None:
         transformer.to(cpu)
         torch.cuda.empty_cache()
-    model_id = MODELS[model_name]
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(model_id, torch_dtype=torch.bfloat16).cpu()
+
+    model_info = MODELS[model_name]
+
+    if model_info["type"] == "nf4":
+        transformer = load_nf4_transformer(model_info)
+    else:
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+            model_info["repo"], torch_dtype=torch.bfloat16
+        ).cpu()
+
     transformer.eval()
     transformer.high_quality_fp32_output_for_inference = True
-    transformer.to(dtype=torch.bfloat16)
+    if model_info["type"] != "nf4":
+        transformer.to(dtype=torch.bfloat16)
     transformer.requires_grad_(False)
     DynamicSwapInstaller.install_model(transformer, device=gpu)
     orig_forward = transformer.__class__.forward
     _current_model_name = model_name
     free_mem_gb = get_cuda_free_memory_gb(gpu)
-    print(f'Loaded {model_name} ({model_id}) — Free VRAM: {free_mem_gb:.2f} GB')
+    print(f'Loaded {model_name} — Free VRAM: {free_mem_gb:.2f} GB')
 
-# Load default model (F1) at startup
-load_transformer("FramePack F1 (Recommended)")
+# Load default model (NF4) at startup
+load_transformer("FramePack F1 NF4 4-bit (7GB VRAM)")
 
 # ---------------------------------------------------------------------------
 # State
@@ -579,7 +615,7 @@ with block:
             # Top bar: model + attention
             with gr.Row():
                 model_selector = gr.Dropdown(
-                    choices=list(MODELS.keys()), value="FramePack F1 (Recommended)",
+                    choices=list(MODELS.keys()), value="FramePack F1 NF4 4-bit (7GB VRAM)",
                     label="Model", interactive=True)
                 attn_selector = gr.Dropdown(
                     choices=ATTN_BACKENDS, value="sdpa",
