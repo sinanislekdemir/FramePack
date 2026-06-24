@@ -29,6 +29,30 @@ NF4 quantization uses NormalFloat4, which is designed for normally-distributed w
 ### MagCache Integration (~1.5-2x speedup)
 Integrated from [Zehong-Ma/FramePack](https://github.com/Zehong-Ma/FramePack/tree/integrate_MagCache). MagCache skips redundant transformer block computations during sampling with minimal quality loss. Available alongside TeaCache in the UI — only one cache can be active at a time. Usable with ALL model variants (NF4 and bf16, F1 and Legacy).
 
+### LLaMA LoRA / Text Encoder Abliteration
+Apply a LoRA adapter to the LLaMA-3-8B text encoder to modify how prompts are interpreted. Useful for abliteration (removing refusal directions) or other text-encoder fine-tuning effects. The feature is non-destructive — the LoRA modifies only the text embeddings that feed into the DiT transformer, not the transformer itself.
+
+| Setting | Description |
+|---------|-------------|
+| **Use LLaMA LoRA** | Checkbox to enable/disable the adapter |
+| **LLaMA LoRA Preset** | Dropdown with pre-configured adapters that auto-download from HuggingFace |
+| **LLaMA LoRA Path** | Appears when "Custom ..." is selected; accepts a local path or `org/repo` HF repo ID |
+
+**Preset adapter** — `reissbaker/llama-3.1-8b-abliterated-lora` (671MB, rank 64, Apache 2.0). Extracted from `mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated`, modifies all attention + MLP projections across 32 layers. Downloads automatically to `hf_download/llama_lora_adapters/` on first use.
+
+**Compatibility** — the HunyuanVideo text encoder is an extracted LLaMA-3-8B (`hidden_size=4096`, 32 layers, 32 heads). Any PEFT-format LoRA targeting LLaMA-3/3.1-8B modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) is compatible. The adapter config is auto-patched for bare `LlamaModel` compatibility (task type and key prefix remapping).
+
+**VRAM impact** — transient only. The text encoder (with LoRA) is loaded to GPU for prompt encoding (~5-10s) then offloaded before sampling begins. No persistent VRAM cost beyond the base text encoder.
+
+### FFmpeg 2x Upscale
+After generation completes, optionally upscale the final video to 2x resolution using ffmpeg. Uses Lanczos scaling with `libx264` at `slow` preset and `crf=min(mp4_crf, 14)` for best quality. Requires ffmpeg in `PATH`.
+
+| Setting | Description |
+|---------|-------------|
+| **Upscale 2x** | Checkbox — when enabled, the final output is upscaled after all sections complete |
+
+Only the final video is upscaled — intermediate clips remain at original resolution. If ffmpeg is not found or fails, the original video is kept.
+
 ### Blackwell GPU Optimizations
 Enabled by default for RTX 50-series cards:
 - `torch.backends.cudnn.benchmark = True` — autotunes cuDNN kernels for VAE convolutions

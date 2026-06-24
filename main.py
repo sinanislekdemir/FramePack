@@ -18,9 +18,12 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import json
+import subprocess
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
+from peft import PeftModel
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
@@ -238,6 +241,114 @@ image_encoder.requires_grad_(False)
 DynamicSwapInstaller.install_model(text_encoder, device=gpu)
 
 # ---------------------------------------------------------------------------
+# LLaMA LoRA adapter for text encoder abliteration
+# ---------------------------------------------------------------------------
+
+LLAMA_LORA_PRESETS = {
+    "None": "",
+    "reissbaker/llama-3.1-8b-abliterated-lora": "reissbaker/llama-3.1-8b-abliterated-lora",
+    "Custom ...": "",
+}
+
+peft_text_encoder = None
+_loaded_lora_id = None
+
+
+def load_llama_lora(lora_path):
+    global peft_text_encoder, _loaded_lora_id
+    if not lora_path:
+        if peft_text_encoder is not None:
+            peft_text_encoder = None
+            _loaded_lora_id = None
+        return False
+
+    if lora_path == _loaded_lora_id and peft_text_encoder is not None:
+        return True
+
+    if "/" in lora_path and not os.path.exists(os.path.join(lora_path, 'adapter_config.json')):
+        download_dir = os.path.join(os.environ['HF_HOME'], 'llama_lora_adapters', lora_path.replace('/', '_'))
+        if not os.path.exists(os.path.join(download_dir, 'adapter_config.json')):
+            print(f'Downloading LLaMA LoRA from HuggingFace: {lora_path}')
+            try:
+                from huggingface_hub import snapshot_download
+                download_dir = snapshot_download(repo_id=lora_path, cache_dir=os.environ['HF_HOME'],
+                                                 local_dir_use_symlinks=False, local_dir=download_dir)
+            except Exception as e:
+                print(f'Failed to download LoRA from HF: {e}')
+                peft_text_encoder = None
+                _loaded_lora_id = None
+                return False
+        lora_path = download_dir
+
+    if not os.path.exists(os.path.join(lora_path, 'adapter_config.json')):
+        peft_text_encoder = None
+        _loaded_lora_id = None
+        return False
+
+    try:
+        if peft_text_encoder is not None:
+            del peft_text_encoder
+            torch.cuda.empty_cache()
+        config_path = os.path.join(lora_path, 'adapter_config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                cfg = json.load(f)
+            if cfg.get('task_type') == 'CAUSAL_LM':
+                cfg['task_type'] = 'FEATURE_EXTRACTION'
+                with open(config_path, 'w') as f:
+                    json.dump(cfg, f, indent=2)
+                print('Patched task_type from CAUSAL_LM to FEATURE_EXTRACTION for LlamaModel compatibility')
+            adapter_file = os.path.join(lora_path, 'adapter_model.safetensors')
+            if os.path.exists(adapter_file):
+                state = sf.load_file(adapter_file)
+                if any('.model.' in k for k in state.keys()):
+                    remapped = {k.replace('base_model.model.', 'base_model.'): v for k, v in state.items()}
+                    sf.save_file(remapped, adapter_file)
+                    print('Remapped adapter keys (stripped .model. prefix for bare LlamaModel)')
+        peft_text_encoder = PeftModel.from_pretrained(text_encoder, lora_path)
+        peft_text_encoder.eval()
+        peft_text_encoder.requires_grad_(False)
+        DynamicSwapInstaller.install_model(peft_text_encoder, device=gpu)
+        _loaded_lora_id = lora_path
+        print(f'Loaded LLaMA LoRA from {lora_path}')
+        return True
+    except Exception as e:
+        print(f'Failed to load LLaMA LoRA: {e}')
+        traceback.print_exc()
+        peft_text_encoder = None
+        _loaded_lora_id = None
+        return False
+
+# ---------------------------------------------------------------------------
+# FFmpeg 2x upscale
+# ---------------------------------------------------------------------------
+
+def ffmpeg_upscale_2x(input_path, output_path, crf=16):
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print('ffmpeg not found — skipping upscale')
+        return False
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', input_path,
+        '-vf', 'scale=iw*2:ih*2:flags=lanczos',
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', str(crf),
+        '-pix_fmt', 'yuv420p',
+        output_path,
+    ]
+    print(f'Upscaling video 2x: {" ".join(cmd)}')
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f'Upscaled video saved to {output_path}')
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f'ffmpeg upscale failed: {e.stderr.decode() if e.stderr else e}')
+        return False
+
+# ---------------------------------------------------------------------------
 # Lazy transformer loading
 # ---------------------------------------------------------------------------
 
@@ -315,6 +426,10 @@ def handle_teacache_change(magcache_value, teacache_value):
         return gr.update(value=False), gr.update(value=True)
     return gr.update(value=magcache_value), gr.update(value=teacache_value)
 
+def handle_lora_preset_change(preset_key):
+    path = LLAMA_LORA_PRESETS.get(preset_key, "")
+    return gr.update(value=path, visible=(preset_key == "Custom ..."))
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -323,8 +438,14 @@ def handle_teacache_change(magcache_value, teacache_value):
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size,
            steps, cfg, gs, rs, gpu_memory_preservation, use_magcache, use_teacache,
            mp4_crf, attn_backend, model_name,
-           magcache_thresh=0.1, magcache_K=3, magcache_retention_ratio=0.2):
+           magcache_thresh=0.1, magcache_K=3, magcache_retention_ratio=0.2,
+           use_llama_lora=False, llama_lora_path="",
+           use_ffmpeg_upscale=False):
+    global peft_text_encoder
     is_f1 = "F1" in model_name
+
+    if use_llama_lora and llama_lora_path:
+        load_llama_lora(llama_lora_path)
 
     set_attention_backend(attn_backend)
     load_transformer(model_name)
@@ -347,11 +468,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        te = peft_text_encoder if (use_llama_lora and peft_text_encoder is not None) else text_encoder
+        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, te, text_encoder_2, tokenizer, tokenizer_2)
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, te, text_encoder_2, tokenizer, tokenizer_2)
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
@@ -551,6 +673,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             if not is_f1 and is_last_section:
                 break
 
+        if use_ffmpeg_upscale:
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(100, 'Upscaling video 2x with ffmpeg ...'))))
+            upscaled_path = os.path.join(outputs_folder, f'{job_id}_2x.mp4')
+            if ffmpeg_upscale_2x(output_filename, upscaled_path, crf=min(mp4_crf, 14)):
+                stream.output_queue.push(('file', upscaled_path))
+
     except:
         traceback.print_exc()
         if not high_vram:
@@ -566,7 +694,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size,
             steps, cfg, gs, rs, gpu_memory_preservation, use_magcache, use_teacache,
             mp4_crf, attn_backend, model_name,
-            magcache_thresh, magcache_K, magcache_retention_ratio):
+            magcache_thresh, magcache_K, magcache_retention_ratio,
+            use_llama_lora, llama_lora_path,
+            use_ffmpeg_upscale):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -576,7 +706,9 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
     async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size,
               steps, cfg, gs, rs, gpu_memory_preservation, use_magcache, use_teacache,
               mp4_crf, attn_backend, model_name,
-              magcache_thresh, magcache_K, magcache_retention_ratio)
+              magcache_thresh, magcache_K, magcache_retention_ratio,
+              use_llama_lora, llama_lora_path,
+              use_ffmpeg_upscale)
 
     output_filename = None
     while True:
@@ -645,6 +777,19 @@ with block:
                 magcache_K = gr.Slider(label="MagCache K", minimum=1, maximum=5, value=3, step=1, info='Decrease this value when the quality is poor.')
                 magcache_retention = gr.Slider(label="MagCache Retention Ratio", minimum=0.0, maximum=1.0, value=0.2, step=0.01, info='Increase to make video more consistent with non-cached generation.')
 
+                with gr.Row():
+                    use_llama_lora = gr.Checkbox(label="Use LLaMA LoRA", value=False, info='Apply a LoRA adapter to the LLaMA text encoder (e.g. for abliteration).')
+                with gr.Row():
+                    llama_lora_preset = gr.Dropdown(
+                        choices=list(LLAMA_LORA_PRESETS.keys()), value="None",
+                        label="LLaMA LoRA Preset", interactive=True,
+                        info='Select a pre-made abliteration LoRA or "Custom" to provide your own.')
+                llama_lora_path = gr.Textbox(label="LLaMA LoRA Path", value="", placeholder="/path/to/lora_adapter or org/repo", info='Path to PEFT LoRA adapter, or HuggingFace repo ID. Auto-downloads from HF.', visible=False)
+                llama_lora_preset.change(
+                    fn=handle_lora_preset_change,
+                    inputs=[llama_lora_preset],
+                    outputs=[llama_lora_path])
+
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
                 seed = gr.Number(label="Seed", value=31337, precision=0)
                 total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
@@ -655,6 +800,7 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=4, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed.")
+                use_ffmpeg_upscale = gr.Checkbox(label="Upscale final video 2x with ffmpeg", value=False, info='Upscale the final output video to 2x resolution using ffmpeg (lanczos, slow preset). Requires ffmpeg in PATH.')
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -667,7 +813,9 @@ with block:
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size,
            steps, cfg, gs, rs, gpu_memory_preservation, use_magcache, use_teacache,
            mp4_crf, attn_selector, model_selector,
-           magcache_thresh, magcache_K, magcache_retention]
+           magcache_thresh, magcache_K, magcache_retention,
+           use_llama_lora, llama_lora_path,
+           use_ffmpeg_upscale]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
