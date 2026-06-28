@@ -250,16 +250,51 @@ def uniform_random_by_intervals(inclusive, exclusive, n, round_to_int=False):
 
 
 def soft_append_bcthw(history, current, overlap=0):
+    was_uint8_hist = history.dtype == torch.uint8
+    was_uint8_curr = current.dtype == torch.uint8
+
     if overlap <= 0:
-        return torch.cat([history, current], dim=2)
+        if was_uint8_hist:
+            history = history.float() / 127.5 - 1.0
+        if was_uint8_curr:
+            current = current.float() / 127.5 - 1.0
+        output = torch.cat([history, current], dim=2)
+        if was_uint8_hist or was_uint8_curr:
+            output = (output.clamp(-1., 1.) * 127.5 + 127.5).to(torch.uint8)
+            return output
+        return output.to(history)
 
     assert history.shape[2] >= overlap, f"History length ({history.shape[2]}) must be >= overlap ({overlap})"
     assert current.shape[2] >= overlap, f"Current length ({current.shape[2]}) must be >= overlap ({overlap})"
-    
-    weights = torch.linspace(1, 0, overlap, dtype=history.dtype, device=history.device).view(1, 1, -1, 1, 1)
-    blended = weights * history[:, :, -overlap:] + (1 - weights) * current[:, :, :overlap]
-    output = torch.cat([history[:, :, :-overlap], blended, current[:, :, overlap:]], dim=2)
 
+    hist_overlap = history[:, :, -overlap:]
+    curr_overlap = current[:, :, :overlap]
+
+    if was_uint8_hist:
+        hist_overlap = hist_overlap.float() / 127.5 - 1.0
+    if was_uint8_curr:
+        curr_overlap = curr_overlap.float() / 127.5 - 1.0
+
+    weights = torch.linspace(1, 0, overlap, dtype=hist_overlap.dtype, device=hist_overlap.device).view(1, 1, -1, 1, 1)
+    blended = weights * hist_overlap + (1 - weights) * curr_overlap
+
+    if was_uint8_hist or was_uint8_curr:
+        blended = (blended.clamp(-1., 1.) * 127.5 + 127.5).to(torch.uint8)
+
+        hist_prefix = history[:, :, :-overlap]
+        curr_suffix = current[:, :, overlap:]
+
+        if not was_uint8_hist:
+            hist_prefix = (hist_prefix.clamp(-1., 1.) * 127.5 + 127.5).to(torch.uint8)
+        if not was_uint8_curr:
+            curr_suffix = (curr_suffix.clamp(-1., 1.) * 127.5 + 127.5).to(torch.uint8)
+
+        output = torch.cat([hist_prefix, blended, curr_suffix], dim=2)
+        return output
+
+    hist_prefix = history[:, :, :-overlap]
+    curr_suffix = current[:, :, overlap:]
+    output = torch.cat([hist_prefix, blended, curr_suffix], dim=2)
     return output.to(history)
 
 
@@ -273,7 +308,8 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
             break
 
     os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
-    x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
+    if x.dtype != torch.uint8:
+        x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
     x = x.detach().cpu().to(torch.uint8)
     x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
     torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})

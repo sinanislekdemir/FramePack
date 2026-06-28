@@ -20,6 +20,7 @@ import argparse
 import math
 import json
 import subprocess
+import gc
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -648,6 +649,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             else:
                 real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
+            current_pixels = None
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
@@ -669,6 +671,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
             stream.output_queue.push(('file', output_filename))
+
+            if history_pixels.dtype != torch.uint8:
+                history_pixels = (history_pixels.clamp(-1., 1.) * 127.5 + 127.5).to(torch.uint8)
+
+            del generated_latents, current_pixels
+            gc.collect()
 
             if not is_f1 and is_last_section:
                 break
